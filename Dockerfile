@@ -1,9 +1,12 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 # System deps for Playwright + pdftotext + curl (used by Revolut auth)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     poppler-utils \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,8 +15,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers (chromium only, for HTML-to-PDF)
-RUN playwright install --with-deps chromium
+# Install Playwright chromium (skip system deps - we installed fonts manually)
+RUN playwright install chromium
 
 # Copy API code
 COPY api.py .
