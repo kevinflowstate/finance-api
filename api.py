@@ -17,13 +17,14 @@ import os
 import sys
 import json
 import time
+import pickle
 import subprocess
 import base64
 import asyncio
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Header, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 
 app = FastAPI(title="Flowstate Finance API", version="1.0.0")
 
@@ -245,6 +246,7 @@ async def upload_file(
         'config.json', 'credentials.json', 'synergy_credentials.json',
         'certificate.pem', 'private.key', 'synergy_public.pem', 'synergy_private.pem',
         'google_token.pickle', 'google_token_flowstatesystems.pickle', 'google_token_synergy.pickle',
+        'google_credentials.json',
         'transactions_raw.json', 'synergy_transactions_raw.json',
         'stripe_charges.json', 'stripe_customer_map.json',
         'synergy_stripe_charges.json', 'synergy_stripe_customer_map.json',
@@ -279,3 +281,154 @@ def list_data(x_api_key: Optional[str] = Header(None)):
                 "modified": datetime.fromtimestamp(os.path.getmtime(path)).isoformat(),
             })
     return {"files": files}
+
+
+# ============================================================
+# GOOGLE OAUTH - Client token onboarding
+# ============================================================
+# Allows a client to authorise Gmail + Drive + Sheets access via a browser link.
+# Flow: /auth/google?name=clientname -> Google consent -> /auth/callback -> token saved
+#
+# Requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET env vars.
+# Or reads from /data/google_credentials.json if present.
+
+GOOGLE_SCOPES = [
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/spreadsheets',
+]
+
+
+def _get_google_oauth_config():
+    """Load Google OAuth client config from env vars or credentials file."""
+    client_id = os.environ.get('GOOGLE_CLIENT_ID', '')
+    client_secret = os.environ.get('GOOGLE_CLIENT_SECRET', '')
+
+    if not client_id or not client_secret:
+        creds_path = os.path.join(DATA_DIR, 'google_credentials.json') if DATA_DIR else ''
+        if creds_path and os.path.exists(creds_path):
+            with open(creds_path, 'r') as f:
+                data = json.load(f)
+            # Handle both "installed" and "web" client types
+            cfg = data.get('installed', data.get('web', {}))
+            client_id = cfg.get('client_id', '')
+            client_secret = cfg.get('client_secret', '')
+
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=500, detail="Google OAuth not configured")
+
+    return client_id, client_secret
+
+
+@app.get("/auth/google")
+def auth_google_start(
+    name: str = Query(..., description="Client name for the token file, e.g. 'acme'"),
+    x_api_key: Optional[str] = Header(None),
+):
+    """Start Google OAuth flow. Redirects the user to Google consent screen."""
+    check_auth(x_api_key)
+    client_id, _ = _get_google_oauth_config()
+
+    # Build the callback URL from the current request
+    base_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
+    if base_url:
+        callback_url = f"https://{base_url}/auth/callback"
+    else:
+        callback_url = "https://finance-api-production-e99f.up.railway.app/auth/callback"
+
+    # Store the client name in a temp file so the callback knows who this is for
+    state = base64.urlsafe_b64encode(name.encode()).decode()
+
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={client_id}"
+        f"&redirect_uri={callback_url}"
+        f"&response_type=code"
+        f"&scope={'+'.join(GOOGLE_SCOPES)}"
+        f"&access_type=offline"
+        f"&prompt=consent"
+        f"&state={state}"
+    )
+
+    return RedirectResponse(url=auth_url)
+
+
+@app.get("/auth/callback")
+def auth_google_callback(
+    code: str = Query(...),
+    state: str = Query(''),
+):
+    """Google OAuth callback. Exchanges code for tokens, saves pickle."""
+    client_id, client_secret = _get_google_oauth_config()
+
+    name = base64.urlsafe_b64decode(state.encode()).decode() if state else 'unknown'
+
+    base_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
+    if base_url:
+        callback_url = f"https://{base_url}/auth/callback"
+    else:
+        callback_url = "https://finance-api-production-e99f.up.railway.app/auth/callback"
+
+    # Exchange auth code for tokens
+    import urllib.request
+    import urllib.parse
+
+    token_data = urllib.parse.urlencode({
+        'code': code,
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'redirect_uri': callback_url,
+        'grant_type': 'authorization_code',
+    }).encode()
+
+    req = urllib.request.Request(
+        'https://oauth2.googleapis.com/token',
+        data=token_data,
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+    )
+
+    try:
+        resp = urllib.request.urlopen(req)
+        tokens = json.loads(resp.read())
+    except Exception as e:
+        return HTMLResponse(
+            content=f"<h2>OAuth Failed</h2><p>{e}</p>",
+            status_code=400,
+        )
+
+    if 'access_token' not in tokens:
+        return HTMLResponse(
+            content=f"<h2>OAuth Failed</h2><p>{json.dumps(tokens)}</p>",
+            status_code=400,
+        )
+
+    # Build a google.oauth2.credentials.Credentials object and pickle it
+    from google.oauth2.credentials import Credentials
+
+    creds = Credentials(
+        token=tokens['access_token'],
+        refresh_token=tokens.get('refresh_token'),
+        token_uri='https://oauth2.googleapis.com/token',
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=GOOGLE_SCOPES,
+    )
+
+    # Save as pickle - filename: google_token_{name}.pickle
+    safe_name = ''.join(c for c in name if c.isalnum() or c in '-_').lower()
+    token_filename = f"google_token_{safe_name}.pickle"
+    token_path = os.path.join(DATA_DIR, token_filename)
+
+    with open(token_path, 'wb') as f:
+        pickle.dump(creds, f)
+
+    return HTMLResponse(content=f"""
+    <html>
+    <body style="font-family: sans-serif; max-width: 600px; margin: 50px auto; text-align: center;">
+        <h2 style="color: #22c55e;">Google Account Connected</h2>
+        <p>Token saved as <code>{token_filename}</code></p>
+        <p>Gmail, Drive, and Sheets access authorised for <strong>{name}</strong>.</p>
+        <p style="color: #666; margin-top: 40px;">You can close this tab.</p>
+    </body>
+    </html>
+    """, status_code=200)
