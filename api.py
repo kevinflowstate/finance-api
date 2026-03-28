@@ -142,7 +142,7 @@ def fetch_data(
     script = SCRIPTS[f'fetch_{entity}']
     step_name = f'fetch_{entity}'
 
-    result = run_script(script, timeout=120)
+    result = run_script(script, timeout=300)
     update_step_status(step_name, result['success'], result['output'], result['duration_seconds'])
     return result
 
@@ -194,8 +194,8 @@ def full_pipeline(x_api_key: Optional[str] = Header(None)):
     check_auth(x_api_key)
 
     steps = [
-        ('fetch_flowstate', 'fetch_data.py', [], 120),
-        ('fetch_synergy', 'synergy_fetch_data.py', [], 120),
+        ('fetch_flowstate', 'fetch_data.py', [], 300),
+        ('fetch_synergy', 'synergy_fetch_data.py', [], 300),
         ('build_flowstate', 'build_finance_sheet.py', [], 180),
         ('build_synergy', 'synergy_build_finance_sheet.py', [], 180),
         ('scan_invoices', 'scan_invoices.py', [], 300),
