@@ -133,12 +133,28 @@ def fetch_revolut_transactions(access_token):
 # STRIPE - Pull charges (when key is available)
 # ============================================================
 def fetch_stripe_charges():
-    """Pull all Synergy Stripe charges with pagination."""
+    """Pull Synergy Stripe charges incrementally - only new ones since last fetch."""
     if not SYNERGY_STRIPE_KEY:
         print("No Synergy Stripe key configured - skipping Stripe fetch")
         return 0
 
-    all_charges = []
+    output_path = os.path.join(REVOLUT_DIR, 'synergy_stripe_charges.json')
+
+    # Load existing charges to find the most recent one
+    existing = []
+    if os.path.exists(output_path):
+        with open(output_path, 'r') as f:
+            existing = json.load(f)
+
+    # Find the most recent charge timestamp for incremental fetch
+    created_after = None
+    if existing:
+        latest_ts = max(c.get('created', 0) for c in existing)
+        if latest_ts > 0:
+            created_after = latest_ts
+            print(f"Incremental fetch: only charges after {datetime.fromtimestamp(latest_ts).strftime('%d %b %Y')}")
+
+    all_new_charges = []
     has_more = True
     starting_after = None
     page = 0
@@ -148,6 +164,8 @@ def fetch_stripe_charges():
         url = 'https://api.stripe.com/v1/charges?limit=100'
         if starting_after:
             url += f'&starting_after={starting_after}'
+        if created_after:
+            url += f'&created[gt]={created_after}'
 
         result = subprocess.run([
             'curl', '-s', url,
@@ -156,7 +174,7 @@ def fetch_stripe_charges():
 
         resp = json.loads(result.stdout)
         charges = resp.get('data', [])
-        all_charges.extend(charges)
+        all_new_charges.extend(charges)
         has_more = resp.get('has_more', False)
 
         if charges:
@@ -164,11 +182,24 @@ def fetch_stripe_charges():
 
         print(f"Fetched {len(charges)} Synergy Stripe charges (page {page})")
 
-    output_path = os.path.join(REVOLUT_DIR, 'synergy_stripe_charges.json')
+    # Merge new with existing, deduplicate by ID
+    if existing and all_new_charges:
+        existing_ids = {c['id'] for c in existing}
+        for c in all_new_charges:
+            if c['id'] not in existing_ids:
+                existing.append(c)
+        all_charges = existing
+        print(f"Merged {len(all_new_charges)} new charges with {len(existing) - len(all_new_charges)} existing")
+    elif all_new_charges:
+        all_charges = all_new_charges
+    else:
+        all_charges = existing
+        print("No new charges found")
+
     with open(output_path, 'w') as f:
         json.dump(all_charges, f, indent=2)
 
-    print(f"Saved {len(all_charges)} Synergy Stripe charges")
+    print(f"Saved {len(all_charges)} Synergy Stripe charges total")
 
     # Build customer map
     customer_ids = set()
