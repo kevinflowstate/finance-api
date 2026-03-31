@@ -169,7 +169,7 @@ def fetch_stripe_charges():
             url += f'&created[gt]={created_after}'
 
         result = subprocess.run([
-            'curl', '-s', url,
+            'curl', '-s', '--globoff', url,
             '-u', f'{STRIPE_KEY}:'
         ], capture_output=True, text=True)
 
